@@ -249,34 +249,38 @@
 {%- endmacro -%}
 
 
-{#- Collect the databases and schemas that carry constraint tests, as a dict of
+{#- Collect the databases and schemas the warm should cover, as a dict of
     {database: [schema, ...]}.
 
-    This drives the bulk metadata warm. It reads node.database and node.schema
-    straight off the graph rather than building relations, so it costs nothing
-    beyond one pass over the constraint tests. -#}
+    Scope is every test's `attached_node`, the model the constraint is actually
+    written to, and deliberately NOT the rest of its `depends_on`. A foreign
+    key's parent is frequently in another database entirely: under deferral the
+    child builds into a PR schema while the parent resolves to production. A
+    parent-inclusive scope therefore warms a whole second database to answer a
+    handful of lookups, which on a large warehouse costs more than it saves.
+
+    Parents outside the warmed set are not lost, they just fall through to
+    upstream's per-table SHOW, which is bounded by the number of distinct
+    parents rather than by the size of their database. In a normal deployment
+    the parents are dims carrying their own primary key tests, so their schema
+    is already a warm target and nothing falls through at all. -#}
 {%- macro constraint_warm_targets(constraint_types) -%}
     {%- set targets = {} -%}
     {%- for test_model in graph.nodes.values() | selectattr("resource_type", "equalto", "test")
             if test_model.test_metadata
             and test_model.test_metadata.name
             and test_model.test_metadata.name is in( constraint_types )
-            and test_model.depends_on
-            and test_model.depends_on.nodes -%}
-        {%- for node_id in test_model.depends_on.nodes -%}
-            {#- Sources live in graph.sources, models and seeds in graph.nodes.
-                Missing one only costs a per-table fallback, never correctness. -#}
-            {%- set node = graph.nodes.get(node_id) or graph.sources.get(node_id) -%}
-            {%- if node and node.database and node.schema -%}
-                {%- set db = node.database | upper -%}
-                {%- if db not in targets -%}
-                    {%- do targets.update({db: []}) -%}
-                {%- endif -%}
-                {%- if (node.schema | upper) not in targets[db] -%}
-                    {%- do targets[db].append(node.schema | upper) -%}
-                {%- endif -%}
+            and test_model.attached_node -%}
+        {%- set node = graph.nodes.get(test_model.attached_node) -%}
+        {%- if node and node.database and node.schema -%}
+            {%- set db = node.database | upper -%}
+            {%- if db not in targets -%}
+                {%- do targets.update({db: []}) -%}
             {%- endif -%}
-        {%- endfor -%}
+            {%- if (node.schema | upper) not in targets[db] -%}
+                {%- do targets[db].append(node.schema | upper) -%}
+            {%- endif -%}
+        {%- endif -%}
     {%- endfor -%}
     {{ return(targets) }}
 {%- endmacro -%}

@@ -62,6 +62,15 @@
             {%- do scopes.append("DATABASE " ~ database) -%}
         {%- endif -%}
 
+        {#- A database-scoped warm reads every schema in the database, including
+            ones this project never touches, so when one is chosen it should be
+            visible without reading the code. This is the first line to check if
+            the warm is slow. -#}
+        {%- do log("dbt_constraints: warming " ~ database ~ " (" ~ schemas | length
+                   ~ " schema(s) in scope) via " ~ scopes | length ~ " x 3 "
+                   ~ ("schema-scoped" if schemas | length <= schema_threshold else "database-scoped")
+                   ~ " metadata read(s)", info=true) -%}
+
         {#- Constraint metadata. PRIMARY KEYS and UNIQUE KEYS both land in the
             unique_keys bucket, matching how upstream's per-table lookup treats
             them as interchangeable for satisfying a foreign key's parent.
