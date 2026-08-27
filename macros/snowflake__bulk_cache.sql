@@ -1,23 +1,33 @@
-{#- Bulk pre-warm of the constraint lookup cache. OFF BY DEFAULT.
+{#- Bulk pre-warm of the constraint lookup cache.
 
-    The idea: upstream discovers current constraint state with roughly four
-    round trips per table (SHOW UNIQUE KEYS, SHOW PRIMARY KEYS, SHOW IMPORTED
-    KEYS, SHOW COLUMNS), from a cache that starts empty every run. All three
-    constraint SHOWs also accept IN DATABASE or IN SCHEMA, and columns are
-    available from INFORMATION_SCHEMA, so the whole cache can be filled from a
-    handful of reads instead.
+    Upstream discovers current state with roughly four `SHOW ... IN TABLE` round
+    trips per table, from a cache that starts empty every run. Whether replacing
+    those with bulk reads is a win depends entirely on which read you replace,
+    and the two halves behave completely differently.
 
-    Why it is off: measured against a large production warehouse, it loses, and
-    not narrowly. A per-table SHOW costs about 0.09s on Snowflake, so 721 of
-    them totalled roughly 61s; the bulk equivalent cost 268s over 16 queries.
-    Most of that is INFORMATION_SCHEMA.COLUMNS, which scales with the number of
-    objects in the whole database rather than with the schemas asked for, and
-    SHOW ... IN DATABASE averaged 19.3s against a 1300-table database.
+    Measured on Snowflake, server-side (compile + execute):
 
-    The premise this was built on, that per-table round trips are expensive, is
-    simply false at Snowflake's actual latency. Enable it only where the target
-    database is small or isolated, or where per-table lookups are measurably
-    slow. The integration project is such a shape; a shared warehouse is not. -#}
+      SHOW <kind> KEYS IN SCHEMA      0.26s   covers an entire schema
+      SHOW <kind> KEYS IN TABLE       0.08s   covers one table
+      SHOW <kind> KEYS IN DATABASE   19.30s   scans every schema in the database
+      INFORMATION_SCHEMA.COLUMNS      5.57s   of which 3.49s is COMPILATION
+
+    So schema-scoped constraint reads are a large win: 0.26s to cover a
+    144-table schema against roughly 11.5s doing it a table at a time. Those are
+    on by default.
+
+    Column metadata is the opposite. `INFORMATION_SCHEMA` compilation scales with
+    the number of objects in the whole database rather than with the schemas
+    asked for, and the result is one row per column, which then has to be walked
+    in Jinja at a measured ~0.8ms per row. A single schema can return 8,000+ rows,
+    and a CI database holding every open branch's schemas is far worse. That read
+    is off by default, and when it is enabled it aggregates server-side to one
+    row per table.
+
+    The bigger win on columns is not fetching them at all: see
+    `table_columns_all_exist`, which skips the lookup entirely for a
+    contract-enforced model, because the contract already guarantees what the
+    lookup would check. -#}
 
 
 {%- macro warm_lookup_cache(constraint_types, lookup_cache) -%}
@@ -31,31 +41,26 @@
 {%- endmacro -%}
 
 
-{#- Fill `lookup_cache.bulk` for every database in `targets`, a dict of
-    {database: [schema, ...]}. A database is only recorded in
-    `lookup_cache.bulk.databases` when every one of its constraint reads
-    completed intact; anything else leaves it absent, and the per-table lookups
-    then behave exactly as upstream for every table in it. -#}
 {%- macro snowflake__warm_lookup_cache(constraint_types, lookup_cache) -%}
-    {%- if var('dbt_constraints_bulk_cache', "false")|string|lower != "true" -%}
+    {%- if var('dbt_constraints_bulk_cache', "true")|string|lower != "true" -%}
         {{ return(none) }}
     {%- endif -%}
 
     {%- set targets = dbt_constraints.constraint_warm_targets(constraint_types) -%}
+    {%- if targets | length == 0 -%}
+        {{ return(none) }}
+    {%- endif -%}
 
     {#- SHOW truncates at this many rows without signalling that it did, so a
         result at the cap cannot be trusted to be complete. -#}
     {%- set show_cap = 10000 -%}
 
-    {#- SHOW ... IN DATABASE scans every schema in the database, including ones
-        this project never touches, so on a large shared database it can cost
-        more than the per-table lookups it replaces. SHOW ... IN SCHEMA is far
-        cheaper but costs one query per schema. Measured on Snowflake:
-        IN SCHEMA runs in 0.5s against a small schema and 3.9s against a large
-        one, while IN DATABASE runs in 15s against a 973-table database. So
-        schema scope wins until the schema count passes roughly five, and
-        database scope wins after that. -#}
-    {%- set schema_threshold = var('dbt_constraints_bulk_schema_threshold', 5) | int -%}
+    {#- Schema scope beats database scope until roughly seventy schemas, since
+        0.26s per schema only overtakes a 19.3s database scan well past fifty.
+        The default sits below the crossover so the common case is never the
+        expensive one. -#}
+    {%- set schema_threshold = var('dbt_constraints_bulk_schema_threshold', 50) | int -%}
+    {%- set bulk_columns = var('dbt_constraints_bulk_columns', "false")|string|lower == "true" -%}
 
     {%- for database, schemas in targets.items() -%}
         {%- set state = namespace(truncated=false) -%}
@@ -69,24 +74,21 @@
             {%- do scopes.append("DATABASE " ~ database) -%}
         {%- endif -%}
 
-        {#- A database-scoped warm reads every schema in the database, including
-            ones this project never touches, so when one is chosen it should be
-            visible without reading the code. This is the first line to check if
-            the warm is slow. -#}
         {%- do log("dbt_constraints: warming " ~ database ~ " (" ~ schemas | length
                    ~ " schema(s) in scope) via " ~ scopes | length ~ " x 3 "
                    ~ ("schema-scoped" if schemas | length <= schema_threshold else "database-scoped")
-                   ~ " metadata read(s)", info=true) -%}
+                   ~ " constraint read(s)"
+                   ~ (", plus aggregated column reads" if bulk_columns else ""), info=true) -%}
 
-        {#- Constraint metadata. PRIMARY KEYS and UNIQUE KEYS both land in the
-            unique_keys bucket, matching how upstream's per-table lookup treats
-            them as interchangeable for satisfying a foreign key's parent.
+        {#- PRIMARY KEYS and UNIQUE KEYS both land in the unique_keys bucket,
+            matching how upstream's per-table lookup treats them as
+            interchangeable for satisfying a foreign key's parent.
 
             SHOW IMPORTED KEYS reports two tables per row, the parent and the
             child, so it has no bare schema_name or table_name column. Scoped
-            IN TABLE upstream never had to choose between them; at database
-            scope the child table is the one that owns the constraint, so its
-            fk_ prefixed columns are the ones to key on. -#}
+            IN TABLE upstream never had to choose between them; at bulk scope
+            the child owns the constraint, so its fk_ columns are the ones to
+            key on. -#}
         {%- for show_kind, bucket_name, name_col, col_col, schema_col, table_col in [
                 ('PRIMARY KEYS',  'unique_keys',  'constraint_name', 'column_name',    'schema_name',    'table_name'),
                 ('UNIQUE KEYS',   'unique_keys',  'constraint_name', 'column_name',    'schema_name',    'table_name'),
@@ -102,10 +104,10 @@
                     {%- set state.truncated = true -%}
                 {%- elif rows.rows | length > 0
                          and (rows.rows[0][schema_col] is none or rows.rows[0][table_col] is none) -%}
-                    {#- The column this bulk read keys on is absent or null, which
-                        means Snowflake's SHOW output has changed shape. Keying on it
-                        anyway would build wrong cache entries and silently recreate
-                        constraints that already exist, so refuse to warm instead. -#}
+                    {#- The keying column is absent or null, so Snowflake's SHOW
+                        output has changed shape. Keying on it anyway would build
+                        wrong cache entries and silently recreate constraints that
+                        already exist, so refuse to warm instead. -#}
                     {%- do log("dbt_constraints: SHOW " ~ show_kind ~ " IN " ~ scope
                                ~ " did not return usable " ~ schema_col ~ "/" ~ table_col
                                ~ " columns. Falling back to per-table lookups for this database.", info=true) -%}
@@ -127,38 +129,32 @@
             {%- endfor -%}
         {%- endfor -%}
 
-        {#- Column metadata. INFORMATION_SCHEMA has no row cap, and is filtered
-            down to the schemas that actually carry constraint tests so the
-            result stays proportional to the work rather than to the database. -#}
-        {%- if schemas | length > 0 -%}
+        {#- Column metadata, off by default. Aggregated server-side to one row
+            per table: the un-aggregated form returns one row per column, and at
+            ~0.8ms per row in Jinja that dominates everything else the hook does. -#}
+        {%- if bulk_columns and schemas | length > 0 -%}
             {%- set schema_csv = "'" ~ (schemas | map('upper') | join("','")) ~ "'" -%}
             {%- set col_query -%}
                 select upper(table_schema) as "table_schema",
                        upper(table_name)   as "table_name",
-                       upper(column_name)  as "column_name",
-                       is_nullable         as "is_nullable",
-                       data_type           as "data_type"
+                       array_agg(upper(column_name))                                          as "columns",
+                       array_agg(case when is_nullable = 'NO' then upper(column_name) end)    as "not_null",
+                       array_agg(case when data_type in ('VARIANT', 'ARRAY', 'OBJECT')
+                                      then upper(column_name) end)                            as "semi_structured"
                 from {{ database }}.information_schema.columns
                 where upper(table_schema) in ( {{ schema_csv }} )
+                group by 1, 2
             {%- endset -%}
             {%- set col_rows = run_query(col_query) -%}
 
             {%- for row in col_rows.rows -%}
                 {%- set fqn = (database ~ '.' ~ row['table_schema'] ~ '.' ~ row['table_name']) | upper -%}
-                {%- if fqn not in lookup_cache.bulk.columns -%}
-                    {%- do lookup_cache.bulk.columns.update({fqn: []}) -%}
-                    {%- do lookup_cache.bulk.not_null.update({fqn: []}) -%}
-                    {%- do lookup_cache.bulk.semi_structured.update({fqn: []}) -%}
-                {%- endif -%}
-                {%- do lookup_cache.bulk.columns[fqn].append(row['column_name']) -%}
-                {%- if row['is_nullable'] == 'NO' -%}
-                    {%- do lookup_cache.bulk.not_null[fqn].append(row['column_name']) -%}
-                {%- endif -%}
-                {#- Snowflake rejects NOT NULL on semi-structured columns, so
-                    upstream skips them; identify them the same way here. -#}
-                {%- if row['data_type'] in ('VARIANT', 'ARRAY', 'OBJECT') -%}
-                    {%- do lookup_cache.bulk.semi_structured[fqn].append(row['column_name']) -%}
-                {%- endif -%}
+                {#- ARRAY_AGG drops nothing, so the conditional aggregates carry a
+                    null per non-matching column; strip them rather than letting a
+                    null land in a column-name list. -#}
+                {%- do lookup_cache.bulk.columns.update({ fqn: fromjson(row['columns']) | reject('none') | list }) -%}
+                {%- do lookup_cache.bulk.not_null.update({ fqn: fromjson(row['not_null']) | reject('none') | list }) -%}
+                {%- do lookup_cache.bulk.semi_structured.update({ fqn: fromjson(row['semi_structured']) | reject('none') | list }) -%}
             {%- endfor -%}
         {%- endif -%}
 
@@ -167,7 +163,6 @@
         {%- endif -%}
     {%- endfor -%}
 
-    {%- do log("dbt_constraints: bulk metadata cache warmed for "
-               ~ lookup_cache.bulk.databases | length ~ " database(s), "
-               ~ lookup_cache.bulk.columns | length ~ " table(s)", info=true) -%}
+    {%- do log("dbt_constraints: bulk constraint cache warmed for "
+               ~ lookup_cache.bulk.databases | length ~ " database(s)", info=true) -%}
 {%- endmacro -%}

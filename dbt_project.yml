@@ -45,13 +45,17 @@ vars:
   # Enable this parameter if you want to skip using RELY for join elimination
   dbt_constraints_always_norely: false
 
-  # Fill the constraint lookup cache from bulk metadata reads instead of
-  # several per table. DEFAULT OFF: measured against a large warehouse, the
-  # bulk reads lose badly. Per-table SHOW costs about 0.09s, so 721 of them
-  # total roughly 61s, while the bulk equivalent cost 268s, most of it in
-  # INFORMATION_SCHEMA.COLUMNS, which is slow on databases with many objects.
-  # Only worth enabling on a small or isolated database. See DESIGN.md.
-  dbt_constraints_bulk_cache: false
+  # Read constraint metadata a schema at a time instead of a table at a time.
+  # SHOW <kind> KEYS IN SCHEMA costs 0.26s server-side and covers a whole
+  # schema, against 0.08s per table, so this wins from a handful of tables up.
+  dbt_constraints_bulk_cache: true
+
+  # Read column metadata in bulk as well. DEFAULT OFF: INFORMATION_SCHEMA
+  # compilation scales with the objects in the whole database (3.49s average,
+  # more than its execution time) and it returns a row per column, which then
+  # costs about 0.8ms each to walk in Jinja. Most projects should leave this off
+  # and let contract-enforced models skip the column lookup entirely instead.
+  dbt_constraints_bulk_columns: false
 
   # Apply constraint DDL as parallel ASYNC children of a Snowflake Scripting
   # block instead of one statement per round trip. Set false to restore
@@ -62,9 +66,8 @@ vars:
   # Snowflake is roughly 25 concurrent children.
   dbt_constraints_max_concurrency: 25
 
-  # Warm the bulk cache one schema at a time at or below this many schemas, and
-  # one database at a time above it. SHOW ... IN DATABASE scans every schema in
-  # the database including irrelevant ones, so on a large shared database it can
-  # cost more than the lookups it replaces; SHOW ... IN SCHEMA is much cheaper
-  # but costs a query per schema. Measured break-even is around five schemas.
-  dbt_constraints_bulk_schema_threshold: 5
+  # Warm one schema at a time at or below this many schemas, one database at a
+  # time above it. SHOW ... IN SCHEMA costs 0.26s and SHOW ... IN DATABASE
+  # 19.3s, so schema scope only loses somewhere past seventy schemas. The
+  # default sits below that crossover so the common case is never the slow one.
+  dbt_constraints_bulk_schema_threshold: 50

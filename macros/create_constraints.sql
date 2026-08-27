@@ -442,7 +442,8 @@
             {%- set test_parameters = raw_kwargs -%}
         {%- endif -%}
         {%- set test_name = test_model.test_metadata.name -%}
-        {%- set selected = dbt_constraints.test_selected(test_model, lookup_cache) -%}
+        {%- set selected = none if dbt_constraints.model_build_failed(test_model, lookup_cache)
+                           else dbt_constraints.test_selected(test_model, lookup_cache) -%}
 
         {#- We can shortcut additional tests if the constraint was not selected -#}
         {%- if selected is not none and dbt_constraints_always_norely -%}
@@ -538,7 +539,7 @@
                     schema=table_models[0].schema,
                     identifier=table_models[0].alias ) -%}
                 {%- if table_relation and table_relation.is_table -%}
-                    {%- if dbt_constraints.table_columns_all_exist(table_relation, column_names, lookup_cache) -%}
+                    {%- if dbt_constraints.table_columns_all_exist(table_relation, column_names, lookup_cache, allow_contract_shortcut=true) -%}
                         {%- if test_name == "primary_key" or (target.type == "bigquery"
                             and test_name in("unique_key", "unique_combination_of_columns", "unique"))
                         -%}
@@ -613,9 +614,9 @@
                             {%- do log("Skipping foreign key on " ~ fk_model.name ~ " because pk_column_name/field is missing from test parameters", info=true) -%}
                         {%- elif fk_column_names | length == 0 -%}
                             {%- do log("Skipping foreign key on " ~ fk_model.name ~ " because fk_column_name/column_name is missing from test parameters", info=true) -%}
-                        {%- elif not dbt_constraints.table_columns_all_exist(pk_table_relation, pk_column_names, lookup_cache) -%}
+                        {%- elif not dbt_constraints.table_columns_all_exist(pk_table_relation, pk_column_names, lookup_cache, allow_contract_shortcut=true) -%}
                             {%- do log("Skipping foreign key because a physical column was not found on the pk table: " ~ pk_model.name ~ " " ~ pk_column_names, info=true) -%}
-                        {%- elif not dbt_constraints.table_columns_all_exist(fk_table_relation, fk_column_names, lookup_cache) -%}
+                        {%- elif not dbt_constraints.table_columns_all_exist(fk_table_relation, fk_column_names, lookup_cache, allow_contract_shortcut=true) -%}
                             {%- do log("Skipping foreign key because a physical column was not found on the fk table: " ~ fk_model.name ~ " " ~ fk_column_names, info=true) -%}
                         {%- else  -%}
                             {%- do dbt_constraints.create_foreign_key(pk_table_relation, pk_column_names, fk_table_relation, fk_column_names, ns.verify_permissions, quote_columns, test_parameters.constraint_name, lookup_cache, rely_clause) -%}
@@ -677,8 +678,69 @@
 
 
 
-{# This macro tests that all the column names passed to the macro can be found on the table, ignoring case #}
-{%- macro table_columns_all_exist(table_relation, column_list, lookup_cache) -%}
+{#- Whether this test's model failed or was skipped in this invocation.
+
+    A model that errored or was skipped was not successfully built, so its table
+    is either absent or holds the previous run's rows. Reconciling constraints
+    against it costs metadata lookups and DDL to reach a state the next
+    successful build will redo anyway, and on a first build the table does not
+    exist at all, which upstream discovers only by asking the database.
+
+    Deliberately narrow: only an explicit error or skip suppresses the
+    constraint. A model absent from `results` entirely is left alone, because
+    that is the ordinary case for a run that did not select it, and upstream's
+    `selected_resources` check already governs it. -#}
+{%- macro model_build_failed(test_model, lookup_cache) -%}
+    {%- if lookup_cache.get('result_status') is none -%}
+        {%- set status = {} -%}
+        {%- for res in results if res.node and res.node.unique_id -%}
+            {%- do status.update({res.node.unique_id: res.status | string | lower}) -%}
+        {%- endfor -%}
+        {%- do lookup_cache.update({'result_status': status}) -%}
+    {%- endif -%}
+    {{ return( lookup_cache.result_status.get(test_model.attached_node) in ('error', 'skipped') ) }}
+{%- endmacro -%}
+
+
+{#- Relations whose model declares an enforced dbt contract, keyed the same way
+    as the bulk cache. Built once per run.
+
+    A contract makes dbt fail the build when a model's output columns do not
+    match its declared `columns:`, and a constraint test's column comes from that
+    same declaration. So on a contract-enforced model the question
+    `table_columns_all_exist` asks has already been answered, at build time,
+    more strictly than a metadata lookup could answer it. -#}
+{%- macro contracted_relations(lookup_cache) -%}
+    {%- if lookup_cache.get('contracted') is none -%}
+        {%- set contracted = {} -%}
+        {%- for node in graph.nodes.values()
+                if node.config
+                and node.config.get('contract')
+                and node.config.get('contract').get('enforced')|string|lower == 'true'
+                and node.database and node.schema -%}
+            {%- set key = (node.database ~ '.' ~ node.schema ~ '.' ~ (node.alias or node.name)) | upper -%}
+            {%- do contracted.update({key: true}) -%}
+        {%- endfor -%}
+        {%- do lookup_cache.update({'contracted': contracted}) -%}
+    {%- endif -%}
+    {{ return(lookup_cache.contracted) }}
+{%- endmacro -%}
+
+
+{#- This macro tests that all the column names passed to the macro can be found
+    on the table, ignoring case.
+
+    `allow_contract_shortcut` skips the metadata lookup entirely when the model
+    carries an enforced contract. Callers pass it for the primary key, unique
+    key and foreign key paths, where the only thing being checked is column
+    existence. The not-null path must NOT pass it, because it goes on to read
+    nullability and semi-structured types out of the same cache entry, which
+    only the lookup populates. -#}
+{%- macro table_columns_all_exist(table_relation, column_list, lookup_cache, allow_contract_shortcut=false) -%}
+    {%- if allow_contract_shortcut
+           and dbt_constraints.relation_cache_key(table_relation) in dbt_constraints.contracted_relations(lookup_cache) -%}
+        {{ return(true) }}
+    {%- endif -%}
     {%- set tab_column_list = dbt_constraints.lookup_table_columns(table_relation, lookup_cache) -%}
     {%- set check_columns = column_list|map('upper')|map('trim', '"')|list -%}
     {%- for column in check_columns if column not in tab_column_list -%}

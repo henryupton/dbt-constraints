@@ -27,9 +27,10 @@ PROJECT = os.path.abspath(
 
 FAST = ["--vars", "{dbt_constraints_bulk_cache: true, dbt_constraints_parallel: true}"]
 SERIAL = ["--vars", "{dbt_constraints_bulk_cache: false, dbt_constraints_parallel: false}"]
-# What actually ships: the bulk cache defaults off because it loses on a large
-# warehouse, so parallel DDL alone is the configuration most runs will use.
-DEFAULT = ["--vars", "{dbt_constraints_bulk_cache: false, dbt_constraints_parallel: true}"]
+# What actually ships. Deliberately passes no vars at all, so this arm tracks
+# whatever the defaults in dbt_project.yml become rather than a copy of them
+# that can silently drift out of date.
+DEFAULT = []
 
 # Every log line the package emits immediately before issuing constraint DDL.
 # Their absence is how a run proves it did no work.
@@ -128,7 +129,7 @@ def test_bulk_cache_is_actually_used():
     database.
     """
     out = run_dbt(["test"] + FAST)
-    assert "bulk metadata cache warmed for" in out, (
+    assert "constraint cache warmed for" in out, (
         "bulk cache did not warm; the fast path degraded to per-table lookups\n" + out
     )
-    assert "bulk metadata cache warmed for 0 database(s)" not in out
+    assert "constraint cache warmed for 0 database(s)" not in out
