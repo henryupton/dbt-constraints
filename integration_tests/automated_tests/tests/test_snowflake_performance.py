@@ -27,6 +27,9 @@ PROJECT = os.path.abspath(
 
 FAST = ["--vars", "{dbt_constraints_bulk_cache: true, dbt_constraints_parallel: true}"]
 SERIAL = ["--vars", "{dbt_constraints_bulk_cache: false, dbt_constraints_parallel: false}"]
+# What actually ships: the bulk cache defaults off because it loses on a large
+# warehouse, so parallel DDL alone is the configuration most runs will use.
+DEFAULT = ["--vars", "{dbt_constraints_bulk_cache: false, dbt_constraints_parallel: true}"]
 
 # Every log line the package emits immediately before issuing constraint DDL.
 # Their absence is how a run proves it did no work.
@@ -78,6 +81,25 @@ def test_fast_path_leaves_the_same_state_as_the_serial_path():
         "fast path diverged from serial path\n"
         f"only in serial: {sorted(serial_state - fast_state)}\n"
         f"only in fast:   {sorted(fast_state - serial_state)}"
+    )
+
+
+def test_default_config_leaves_the_same_state_as_the_serial_path():
+    """The shipped configuration, not just the two extremes.
+
+    Bulk cache off and parallel DDL on is what most runs will use, and it was
+    the one combination the original two arms never exercised.
+    """
+    run_dbt(["build", "--full-refresh"] + SERIAL)
+    serial_state = constraint_state()
+
+    run_dbt(["build", "--full-refresh"] + DEFAULT)
+    default_state = constraint_state()
+
+    assert default_state == serial_state, (
+        "default config diverged from serial path\n"
+        f"only in serial:  {sorted(serial_state - default_state)}\n"
+        f"only in default: {sorted(default_state - serial_state)}"
     )
 
 

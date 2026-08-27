@@ -45,10 +45,13 @@ vars:
   # Enable this parameter if you want to skip using RELY for join elimination
   dbt_constraints_always_norely: false
 
-  # Fill the constraint lookup cache with a handful of database-wide metadata
-  # queries instead of several per table. Set false to restore upstream's
-  # per-table SHOW discovery. Snowflake only; other adapters ignore it.
-  dbt_constraints_bulk_cache: true
+  # Fill the constraint lookup cache from bulk metadata reads instead of
+  # several per table. DEFAULT OFF: measured against a large warehouse, the
+  # bulk reads lose badly. Per-table SHOW costs about 0.09s, so 721 of them
+  # total roughly 61s, while the bulk equivalent cost 268s, most of it in
+  # INFORMATION_SCHEMA.COLUMNS, which is slow on databases with many objects.
+  # Only worth enabling on a small or isolated database. See DESIGN.md.
+  dbt_constraints_bulk_cache: false
 
   # Apply constraint DDL as parallel ASYNC children of a Snowflake Scripting
   # block instead of one statement per round trip. Set false to restore

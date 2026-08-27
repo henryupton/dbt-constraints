@@ -1,16 +1,23 @@
-{#- Bulk pre-warm of the constraint lookup cache.
+{#- Bulk pre-warm of the constraint lookup cache. OFF BY DEFAULT.
 
-    Upstream discovers current constraint state with roughly four round trips per
-    table: SHOW UNIQUE KEYS, SHOW PRIMARY KEYS, SHOW IMPORTED KEYS and
-    SHOW COLUMNS, each scoped IN TABLE and each cached only after the fact. The
-    cache starts empty every run, so a project with constraints on a few hundred
-    tables pays that cost serially before the first ALTER is issued, and pays it
-    in full even on a run where nothing needs creating.
+    The idea: upstream discovers current constraint state with roughly four
+    round trips per table (SHOW UNIQUE KEYS, SHOW PRIMARY KEYS, SHOW IMPORTED
+    KEYS, SHOW COLUMNS), from a cache that starts empty every run. All three
+    constraint SHOWs also accept IN DATABASE or IN SCHEMA, and columns are
+    available from INFORMATION_SCHEMA, so the whole cache can be filled from a
+    handful of reads instead.
 
-    All three SHOW commands also accept IN DATABASE, returning the same columns
-    including `rely`, and column metadata is available in bulk from
-    INFORMATION_SCHEMA. So the whole cache can be filled with four queries per
-    database instead. -#}
+    Why it is off: measured against a large production warehouse, it loses, and
+    not narrowly. A per-table SHOW costs about 0.09s on Snowflake, so 721 of
+    them totalled roughly 61s; the bulk equivalent cost 268s over 16 queries.
+    Most of that is INFORMATION_SCHEMA.COLUMNS, which scales with the number of
+    objects in the whole database rather than with the schemas asked for, and
+    SHOW ... IN DATABASE averaged 19.3s against a 1300-table database.
+
+    The premise this was built on, that per-table round trips are expensive, is
+    simply false at Snowflake's actual latency. Enable it only where the target
+    database is small or isolated, or where per-table lookups are measurably
+    slow. The integration project is such a shape; a shared warehouse is not. -#}
 
 
 {%- macro warm_lookup_cache(constraint_types, lookup_cache) -%}
@@ -30,7 +37,7 @@
     completed intact; anything else leaves it absent, and the per-table lookups
     then behave exactly as upstream for every table in it. -#}
 {%- macro snowflake__warm_lookup_cache(constraint_types, lookup_cache) -%}
-    {%- if var('dbt_constraints_bulk_cache', "true")|string|lower != "true" -%}
+    {%- if var('dbt_constraints_bulk_cache', "false")|string|lower != "true" -%}
         {{ return(none) }}
     {%- endif -%}
 

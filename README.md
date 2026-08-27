@@ -16,18 +16,19 @@ Measured on the integration project against Snowflake, same build both ways:
 
 | | Upstream behaviour | This fork |
 | --- | --- | --- |
-| Per-table metadata `SHOW` commands | 90 | 0 |
 | Client statements issued | 171 | 34 |
 | `on-run-end` hook, full refresh | 56.3s | 22.5s |
 | `on-run-end` hook, nothing rebuilt | 34.4s | 10.0s, and no DDL at all |
 
-Resulting constraint state is identical across both paths, verified row by row including every `rely` value. See `DESIGN.md` for the rationale and the Snowflake behaviour it relies on.
+Resulting constraint state is identical across both paths, verified row by row including every `rely` value.
+
+**Those numbers come from a 33-table integration project and do not transfer to a large warehouse.** Measured against a real one, the bulk metadata cache is a net loss: a per-table `SHOW` costs about 0.09s on Snowflake, so 721 of them total roughly 61s, while the bulk equivalent cost 268s, most of it in `INFORMATION_SCHEMA.COLUMNS`. It is therefore **off by default**, and what remains on by default is the parallel DDL and the graph indexing, which win regardless of warehouse size. See `DESIGN.md`.
 
 ### Configuration
 
 | Var | Default | Effect |
 | --- | --- | --- |
-| `dbt_constraints_bulk_cache` | `true` | `false` restores upstream per-table `SHOW` discovery. |
+| `dbt_constraints_bulk_cache` | `false` | `true` fills the lookup cache from bulk metadata reads. Off by default because it loses on a large warehouse, see below. |
 | `dbt_constraints_parallel` | `true` | `false` restores upstream serial `run_query` per statement. |
 | `dbt_constraints_max_concurrency` | `25` | `ASYNC` children per `EXECUTE IMMEDIATE` block. |
 | `dbt_constraints_bulk_schema_threshold` | `5` | Warm per schema at or below this many schemas, per database above it. |

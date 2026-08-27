@@ -237,6 +237,46 @@ hatch is not one.
 **Inherited suites.** Upstream's dbt-core and dbt-fusion integration tests come with the fork
 and both must stay green. The Fusion arm is not optional, because that is what production runs.
 
+## The bulk metadata cache was wrong, and is now off by default
+
+Recorded after measuring against a real warehouse rather than the integration
+project. This is the most important thing on this page.
+
+**The premise was false.** This design asserts that upstream's per-table metadata
+discovery is expensive, and estimated "several hundred serial round-trips" as a
+dominant cost. Measured on Snowflake, a per-table `SHOW` costs about **0.09s**,
+so the 721 of them a full production run issues total roughly **61 seconds**. The
+bulk equivalent, on the same project and the same run shape, cost **268 seconds**
+across 16 queries.
+
+| | queries | total |
+| --- | --- | --- |
+| upstream `SHOW ... KEYS IN TABLE` | 480 | 43.8s (0.09s avg) |
+| upstream `SHOW COLUMNS IN TABLE` | 241 | 16.8s (0.07s avg) |
+| **upstream total** | **721** | **~61s** |
+| fork `SHOW ... IN DATABASE` | 3 | 57.9s (19.3s avg) |
+| fork `SHOW ... IN SCHEMA` | 3 | 8.6s (2.87s avg) |
+| fork `INFORMATION_SCHEMA.COLUMNS` | 10 | ~200s |
+| **fork total** | **16** | **~268s** |
+
+Two things drive it. `INFORMATION_SCHEMA.COLUMNS` scales with the number of
+objects in the entire database rather than with the schemas asked for, and it
+dominates. And `SHOW ... IN DATABASE` averaged 19.3s against a 1300-table
+database, against 0.09s for the targeted per-table form.
+
+Trading many cheap targeted reads for a few expensive broad ones is only a win
+when the per-read overhead dominates. At 0.09s per round trip it does not. The
+earlier measurements that motivated this design were taken against a small
+sandbox schema and a 33-table integration project, and did not generalise.
+
+`dbt_constraints_bulk_cache` therefore **defaults to `false`**. The machinery is
+kept, proven correct and covered by tests, because it does win where the target
+database is small or isolated. It is no longer claimed as a general improvement.
+
+What survives as an unconditional win is the parallel DDL and the graph
+indexing, neither of which depends on warehouse size, plus the two upstream
+not-null bugs fixed below.
+
 ## What implementation changed about this design
 
 Recorded after the fact. Four things the design did not anticipate, all found by
