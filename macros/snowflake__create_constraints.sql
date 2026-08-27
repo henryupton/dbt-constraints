@@ -237,7 +237,11 @@
     {{ return(none) }}
 {%- endif -%}
 
-{#- We didn't find a cache entry for this table so we will lookup existing constraints in DB -#}
+{#- We didn't find a cache entry for this table. The bulk cache, if it covers
+    this relation's database, already knows the answer for every table at once,
+    so try that before spending two round trips here. -#}
+{%- if not dbt_constraints.bulk_seed(table_relation, 'unique_keys', lookup_cache) -%}
+
 {%- do lookup_cache.unique_keys.update({table_relation: {}}) -%}
 
 {%- set lookup_query -%}
@@ -280,6 +284,8 @@ SHOW PRIMARY KEYS IN TABLE {{ table_relation }}
     {% endfor %}
 {%- endif -%}
 
+{%- endif -%}
+
 {#- check again in lookup cache -#}
 {%- for constraint_name, cached_val in lookup_cache.unique_keys[table_relation].items() -%}
     {%- if dbt_constraints.column_list_matches(cached_val.columns, column_names ) -%}
@@ -309,7 +315,10 @@ SHOW PRIMARY KEYS IN TABLE {{ table_relation }}
     {{ return(none) }}
 {%- endif -%}
 
-{#- We didn't find a cache entry for this table so we will lookup existing constraints in DB -#}
+{#- We didn't find a cache entry for this table. Try the bulk cache first; it
+    covers every table in the database from a single earlier query. -#}
+{%- if not dbt_constraints.bulk_seed(table_relation, 'foreign_keys', lookup_cache) -%}
+
 {%- do lookup_cache.foreign_keys.update({table_relation: {}}) -%}
 
 {%- set lookup_query -%}
@@ -330,6 +339,8 @@ SHOW IMPORTED KEYS IN TABLE {{ table_relation }}
             {   "columns": columns,
                 "rely": c_rows[0]["rely"] } }) -%}
     {% endfor %}
+{%- endif -%}
+
 {%- endif -%}
 
 {#- check again in lookup cache -#}
@@ -415,28 +426,40 @@ SHOW IMPORTED KEYS IN TABLE {{ table_relation }}
 
 {%- macro snowflake__lookup_table_columns(table_relation, lookup_cache) -%}
     {%- if table_relation not in lookup_cache.table_columns -%}
-        {%- set lookup_query -%}
-        SHOW COLUMNS IN TABLE {{ table_relation }}
-        {%- endset -%}
-        {%- set results = run_query(lookup_query) -%}
-        {%- set not_null_col = [] -%}
-        {%- set semi_structured_col = [] -%}
-        {%- set upper_column_list = [] -%}
-        {%- for row in results.rows -%}
-            {%- do upper_column_list.append(row["column_name"]|upper) -%}
-            {%- if row['null?'] == 'false' -%}
-                {%- do not_null_col.append(row["column_name"]|upper) -%}
-            {%- endif -%}
-            {%- if row['data_type'] is string -%}
-                {%- set data_type = fromjson( row['data_type'] ) -%}
-                {%- if data_type["type"] in ('VARIANT', 'ARRAY', 'OBJECT') -%}
-                    {%- do semi_structured_col.append(row["column_name"]|upper) -%}
+
+        {#- The bulk warm reads column metadata for every table in the relevant
+            schemas at once, so prefer it over a per-table SHOW COLUMNS. Unlike
+            the constraint buckets, a missing entry here is a genuine miss
+            rather than a negative answer, because every table has columns. -#}
+        {%- if dbt_constraints.bulk_columns_available(table_relation, lookup_cache) -%}
+            {%- set key = dbt_constraints.relation_cache_key(table_relation) -%}
+            {%- do lookup_cache.table_columns.update({ table_relation: lookup_cache.bulk.columns[key] }) -%}
+            {%- do lookup_cache.not_null_col.update({ table_relation: lookup_cache.bulk.not_null[key] }) -%}
+            {%- do lookup_cache.semi_structured_col.update({ table_relation: lookup_cache.bulk.semi_structured[key] }) -%}
+        {%- else -%}
+            {%- set lookup_query -%}
+            SHOW COLUMNS IN TABLE {{ table_relation }}
+            {%- endset -%}
+            {%- set results = run_query(lookup_query) -%}
+            {%- set not_null_col = [] -%}
+            {%- set semi_structured_col = [] -%}
+            {%- set upper_column_list = [] -%}
+            {%- for row in results.rows -%}
+                {%- do upper_column_list.append(row["column_name"]|upper) -%}
+                {%- if row['null?'] == 'false' -%}
+                    {%- do not_null_col.append(row["column_name"]|upper) -%}
                 {%- endif -%}
-            {%- endif -%}
-        {%- endfor -%}
-        {%- do lookup_cache.table_columns.update({ table_relation: upper_column_list }) -%}
-        {%- do lookup_cache.not_null_col.update({ table_relation: not_null_col }) -%}
-        {%- do lookup_cache.semi_structured_col.update({ table_relation: semi_structured_col }) -%}
+                {%- if row['data_type'] is string -%}
+                    {%- set data_type = fromjson( row['data_type'] ) -%}
+                    {%- if data_type["type"] in ('VARIANT', 'ARRAY', 'OBJECT') -%}
+                        {%- do semi_structured_col.append(row["column_name"]|upper) -%}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- endfor -%}
+            {%- do lookup_cache.table_columns.update({ table_relation: upper_column_list }) -%}
+            {%- do lookup_cache.not_null_col.update({ table_relation: not_null_col }) -%}
+            {%- do lookup_cache.semi_structured_col.update({ table_relation: semi_structured_col }) -%}
+        {%- endif -%}
     {%- endif -%}
     {{ return(lookup_cache.table_columns[table_relation]) }}
 {%- endmacro -%}
