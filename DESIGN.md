@@ -1,6 +1,6 @@
 # Design: performance rework of the Snowflake constraint path
 
-Status: approved, not yet implemented.
+Status: implemented and verified against Snowflake.
 Date: 2026-08-27.
 Fork point: `Snowflake-Labs/dbt_constraints` @ 1.0.9 (commit `205b5cf`, which is also upstream `main` HEAD).
 
@@ -236,6 +236,44 @@ hatch is not one.
 
 **Inherited suites.** Upstream's dbt-core and dbt-fusion integration tests come with the fork
 and both must stay green. The Fusion arm is not optional, because that is what production runs.
+
+## What implementation changed about this design
+
+Recorded after the fact. Four things the design did not anticipate, all found by
+running it rather than by reasoning about it.
+
+**Bulk reads have to be scoped by schema, not always by database.** The design
+assumed `SHOW ... IN DATABASE` was strictly better. It is not: it scans every
+schema in the database including ones the project never touches. Measured at 15s
+against a 973-table shared database versus 0.5s for the single schema actually
+needed. Shipping database-scope-always would have made the hook *slower* than
+upstream on small projects. The fork now warms per schema at or below
+`dbt_constraints_bulk_schema_threshold` schemas and per database above it,
+because a large warehouse needing fourteen schemas is the case where database
+scope wins again.
+
+**`SHOW IMPORTED KEYS` has no bare `schema_name` or `table_name` column.** It
+reports two tables per row, the parent and the child, as `pk_` and `fk_` prefixed
+pairs. Scoped `IN TABLE` upstream never had to choose between them. At bulk scope
+the child owns the constraint, so the `fk_` columns are the ones to key on.
+Getting this wrong produced a cache that silently missed every existing foreign
+key and tried to recreate them. The bulk warm now refuses to warm a database
+whose keying columns come back null, so this class of mistake fails loudly.
+
+**Concurrent DDL against the same table is safe for `ADD CONSTRAINT`.** Verified
+by applying five foreign keys to one table concurrently and confirming all five
+landed, reproducibly. This matters because the production shape is fact tables
+carrying four to eight foreign keys each, which all land in the same phase.
+`MODIFY ... SET NOT NULL` was not verified safe under the same conditions, so
+those statements are marked exclusive and kept off a batch already touching their
+table.
+
+**Two upstream not-null bugs were re-issuing every statement on every run.**
+`create_not_null` compared raw test parameters against an uppercased cache so its
+"already not null" check never matched, and the `SHOW COLUMNS` fallback tested
+nullability against `'false'` when Snowflake reports `'NOT_NULL'`. Both are fixed
+here. They caused redundant work, never wrong results, so the end state is
+unchanged. Without the fix the idempotency guarantee below was unreachable.
 
 ## Rollout
 

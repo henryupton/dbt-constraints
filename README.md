@@ -2,6 +2,47 @@
 
 This package generates database constraints based on the tests in a dbt project. It is currently compatible with Snowflake, PostgreSQL, Oracle, Redshift, and Vertica only.
 
+## About this fork
+
+This is a fork of [Snowflake-Labs/dbt_constraints](https://github.com/Snowflake-Labs/dbt_constraints) at 1.0.9, carrying a performance rework of the **Snowflake path only**. Every other adapter is untouched.
+
+Constraint declarations, emitted DDL and RELY semantics are unchanged. What changed is how the work is scheduled:
+
+- **Bulk metadata reads.** Upstream discovers current state with roughly four `SHOW ... IN TABLE` round trips per table, serially, from a cache that starts empty every run. This fork fills the whole cache from a handful of schema-scoped or database-scoped reads.
+- **Parallel DDL.** Constraint statements are batched into a Snowflake Scripting block of `ASYNC` children under `AWAIT ALL`, flushed once per constraint phase so the not_null, PK, UK, FK ordering that foreign keys depend on is preserved.
+- **Graph indexing.** The per-test full-graph scans upstream performs are replaced by indexes built once per run, removing a term that scaled with tests multiplied by graph size.
+
+Measured on the integration project against Snowflake, same build both ways:
+
+| | Upstream behaviour | This fork |
+| --- | --- | --- |
+| Per-table metadata `SHOW` commands | 90 | 0 |
+| Client statements issued | 171 | 34 |
+| `on-run-end` hook, full refresh | 56.3s | 22.5s |
+| `on-run-end` hook, nothing rebuilt | 34.4s | 10.0s, and no DDL at all |
+
+Resulting constraint state is identical across both paths, verified row by row including every `rely` value. See `DESIGN.md` for the rationale and the Snowflake behaviour it relies on.
+
+### Configuration
+
+| Var | Default | Effect |
+| --- | --- | --- |
+| `dbt_constraints_bulk_cache` | `true` | `false` restores upstream per-table `SHOW` discovery. |
+| `dbt_constraints_parallel` | `true` | `false` restores upstream serial `run_query` per statement. |
+| `dbt_constraints_max_concurrency` | `25` | `ASYNC` children per `EXECUTE IMMEDIATE` block. |
+| `dbt_constraints_bulk_schema_threshold` | `5` | Warm per schema at or below this many schemas, per database above it. |
+
+Setting `dbt_constraints_bulk_cache` and `dbt_constraints_parallel` both to `false` reduces the package to upstream behaviour, which is the first diagnostic step for any suspected regression and the control arm the parity tests compare against.
+
+### Two upstream bugs fixed along the way
+
+Both caused redundant work rather than wrong results, so the end state is unaffected:
+
+- `create_not_null` compared raw test parameters against an uppercased cache, so its "already not null" check never matched. The sibling semi-structured check on the next line does normalise case, which marks this an oversight.
+- The `SHOW COLUMNS` fallback tested nullability against `'false'`, but Snowflake reports `'NOT_NULL'`, leaving that cache permanently empty.
+
+Together they re-issued every not-null statement on every run.
+
 ## How the dbt Constraints Package differs from dbt's Model Contracts feature
 
 This package focuses on automatically generating constraints based on the tests already in a user's dbt project. In most cases, merely adding the dbt Constraints package is all that is needed to generate constraints. dbt's recent [model contracts feature](https://docs.getdbt.com/docs/collaborate/govern/model-contracts) allows users to explicitly document constraints for models in yml. This package and the core feature are 100% compatible with one another and the dbt Constraints package will skip generating constraints already created by a model contract. However, the dbt Constraints package will also generate constraints for any tests that are not documented as model contracts. As described in the next section, dbt Constraints is also designed to provide join elimination on Snowflake.
