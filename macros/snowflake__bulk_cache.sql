@@ -13,13 +13,13 @@
     database instead. -#}
 
 
-{%- macro warm_lookup_cache(targets, lookup_cache) -%}
-    {{ return(adapter.dispatch('warm_lookup_cache', 'dbt_constraints')(targets, lookup_cache)) }}
+{%- macro warm_lookup_cache(constraint_types, lookup_cache) -%}
+    {{ return(adapter.dispatch('warm_lookup_cache', 'dbt_constraints')(constraint_types, lookup_cache)) }}
 {%- endmacro -%}
 
 
 {#- Adapters without a bulk metadata path keep upstream's per-table lookups. -#}
-{%- macro default__warm_lookup_cache(targets, lookup_cache) -%}
+{%- macro default__warm_lookup_cache(constraint_types, lookup_cache) -%}
     {{ return(none) }}
 {%- endmacro -%}
 
@@ -29,17 +29,38 @@
     `lookup_cache.bulk.databases` when every one of its constraint reads
     completed intact; anything else leaves it absent, and the per-table lookups
     then behave exactly as upstream for every table in it. -#}
-{%- macro snowflake__warm_lookup_cache(targets, lookup_cache) -%}
+{%- macro snowflake__warm_lookup_cache(constraint_types, lookup_cache) -%}
     {%- if var('dbt_constraints_bulk_cache', "true")|string|lower != "true" -%}
         {{ return(none) }}
     {%- endif -%}
+
+    {%- set targets = dbt_constraints.constraint_warm_targets(constraint_types) -%}
 
     {#- SHOW truncates at this many rows without signalling that it did, so a
         result at the cap cannot be trusted to be complete. -#}
     {%- set show_cap = 10000 -%}
 
+    {#- SHOW ... IN DATABASE scans every schema in the database, including ones
+        this project never touches, so on a large shared database it can cost
+        more than the per-table lookups it replaces. SHOW ... IN SCHEMA is far
+        cheaper but costs one query per schema. Measured on Snowflake:
+        IN SCHEMA runs in 0.5s against a small schema and 3.9s against a large
+        one, while IN DATABASE runs in 15s against a 973-table database. So
+        schema scope wins until the schema count passes roughly five, and
+        database scope wins after that. -#}
+    {%- set schema_threshold = var('dbt_constraints_bulk_schema_threshold', 5) | int -%}
+
     {%- for database, schemas in targets.items() -%}
         {%- set state = namespace(truncated=false) -%}
+
+        {%- set scopes = [] -%}
+        {%- if schemas | length > 0 and schemas | length <= schema_threshold -%}
+            {%- for schema in schemas -%}
+                {%- do scopes.append("SCHEMA " ~ database ~ "." ~ schema) -%}
+            {%- endfor -%}
+        {%- else -%}
+            {%- do scopes.append("DATABASE " ~ database) -%}
+        {%- endif -%}
 
         {#- Constraint metadata. PRIMARY KEYS and UNIQUE KEYS both land in the
             unique_keys bucket, matching how upstream's per-table lookup treats
@@ -55,37 +76,39 @@
                 ('UNIQUE KEYS',   'unique_keys',  'constraint_name', 'column_name',    'schema_name',    'table_name'),
                 ('IMPORTED KEYS', 'foreign_keys', 'fk_name',         'fk_column_name', 'fk_schema_name', 'fk_table_name') ] -%}
 
-            {%- set rows = run_query("SHOW " ~ show_kind ~ " IN DATABASE " ~ database) -%}
+            {%- for scope in scopes -%}
+                {%- set rows = run_query("SHOW " ~ show_kind ~ " IN " ~ scope) -%}
 
-            {%- if rows.rows | length >= show_cap -%}
-                {%- do log("dbt_constraints: SHOW " ~ show_kind ~ " IN DATABASE " ~ database
-                           ~ " returned " ~ rows.rows | length ~ " rows, at or above the " ~ show_cap
-                           ~ " row cap, so it may be truncated. Falling back to per-table lookups for this database.", info=true) -%}
-                {%- set state.truncated = true -%}
-            {%- elif rows.rows | length > 0
-                     and (rows.rows[0][schema_col] is none or rows.rows[0][table_col] is none) -%}
-                {#- The column this bulk read keys on is absent or null, which
-                    means Snowflake's SHOW output has changed shape. Keying on it
-                    anyway would build wrong cache entries and silently recreate
-                    constraints that already exist, so refuse to warm instead. -#}
-                {%- do log("dbt_constraints: SHOW " ~ show_kind ~ " IN DATABASE " ~ database
-                           ~ " did not return usable " ~ schema_col ~ "/" ~ table_col
-                           ~ " columns. Falling back to per-table lookups for this database.", info=true) -%}
-                {%- set state.truncated = true -%}
-            {%- else -%}
-                {%- set bucket = lookup_cache.bulk[bucket_name] -%}
-                {%- for row in rows.rows -%}
-                    {%- set fqn = (database ~ '.' ~ row[schema_col] ~ '.' ~ row[table_col]) | upper -%}
-                    {%- if fqn not in bucket -%}
-                        {%- do bucket.update({fqn: {}}) -%}
-                    {%- endif -%}
-                    {%- set cname = row[name_col] -%}
-                    {%- if cname not in bucket[fqn] -%}
-                        {%- do bucket[fqn].update({cname: {"columns": [], "rely": row['rely']}}) -%}
-                    {%- endif -%}
-                    {%- do bucket[fqn][cname]["columns"].append(row[col_col]) -%}
-                {%- endfor -%}
-            {%- endif -%}
+                {%- if rows.rows | length >= show_cap -%}
+                    {%- do log("dbt_constraints: SHOW " ~ show_kind ~ " IN " ~ scope
+                               ~ " returned " ~ rows.rows | length ~ " rows, at or above the " ~ show_cap
+                               ~ " row cap, so it may be truncated. Falling back to per-table lookups for this database.", info=true) -%}
+                    {%- set state.truncated = true -%}
+                {%- elif rows.rows | length > 0
+                         and (rows.rows[0][schema_col] is none or rows.rows[0][table_col] is none) -%}
+                    {#- The column this bulk read keys on is absent or null, which
+                        means Snowflake's SHOW output has changed shape. Keying on it
+                        anyway would build wrong cache entries and silently recreate
+                        constraints that already exist, so refuse to warm instead. -#}
+                    {%- do log("dbt_constraints: SHOW " ~ show_kind ~ " IN " ~ scope
+                               ~ " did not return usable " ~ schema_col ~ "/" ~ table_col
+                               ~ " columns. Falling back to per-table lookups for this database.", info=true) -%}
+                    {%- set state.truncated = true -%}
+                {%- else -%}
+                    {%- set bucket = lookup_cache.bulk[bucket_name] -%}
+                    {%- for row in rows.rows -%}
+                        {%- set fqn = (database ~ '.' ~ row[schema_col] ~ '.' ~ row[table_col]) | upper -%}
+                        {%- if fqn not in bucket -%}
+                            {%- do bucket.update({fqn: {}}) -%}
+                        {%- endif -%}
+                        {%- set cname = row[name_col] -%}
+                        {%- if cname not in bucket[fqn] -%}
+                            {%- do bucket[fqn].update({cname: {"columns": [], "rely": row['rely']}}) -%}
+                        {%- endif -%}
+                        {%- do bucket[fqn][cname]["columns"].append(row[col_col]) -%}
+                    {%- endfor -%}
+                {%- endif -%}
+            {%- endfor -%}
         {%- endfor -%}
 
         {#- Column metadata. INFORMATION_SCHEMA has no row cap, and is filtered

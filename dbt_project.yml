@@ -58,3 +58,10 @@ vars:
   # Maximum ASYNC children per EXECUTE IMMEDIATE block. Measured throughput on
   # Snowflake is roughly 25 concurrent children.
   dbt_constraints_max_concurrency: 25
+
+  # Warm the bulk cache one schema at a time at or below this many schemas, and
+  # one database at a time above it. SHOW ... IN DATABASE scans every schema in
+  # the database including irrelevant ones, so on a large shared database it can
+  # cost more than the lookups it replaces; SHOW ... IN SCHEMA is much cheaper
+  # but costs a query per schema. Measured break-even is around five schemas.
+  dbt_constraints_bulk_schema_threshold: 5

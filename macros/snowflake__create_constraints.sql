@@ -170,13 +170,19 @@
 {# Lookup any columns that are VARIANT, ARRAY, or OBJECT #}
 {%- set semi_structured_cols = lookup_cache.semi_structured_col[table_relation] -%}
 
+{#- The cache holds uppercased column names, but test parameters arrive in
+    whatever case the YAML used, so this comparison has to normalise. Upstream
+    compares the raw name against the uppercased cache, which never matches, so
+    every already-NOT NULL column is re-issued on every run. The semi-structured
+    check on the next line does normalise, which is what marks this an oversight
+    rather than intent. Same end state either way; this just stops the work. -#}
 {%- set columns_to_change = [] -%}
-{%- for column_name in column_names if column_name not in existing_not_null_col -%}
-    {%- if (column_name | upper) in semi_structured_cols -%}
+{%- for column_name in column_names if (column_name | upper | trim('"')) not in existing_not_null_col -%}
+    {%- if (column_name | upper | trim('"')) in semi_structured_cols -%}
         {%- do log("Skipping not null constraint for " ~ column_name ~ " in " ~ table_relation ~ " because Snowflake does not support not null constraints on ARRAY, OBJECT, or VARIANT columns.", info=true) -%}
     {%- else -%}
         {%- do columns_to_change.append(column_name) -%}
-        {%- do existing_not_null_col.append(column_name) -%}
+        {%- do existing_not_null_col.append(column_name | upper | trim('"')) -%}
     {%- endif -%}
 {%- endfor -%}
 {%- if columns_to_change|count > 0 -%}
@@ -446,7 +452,11 @@ SHOW IMPORTED KEYS IN TABLE {{ table_relation }}
             {%- set upper_column_list = [] -%}
             {%- for row in results.rows -%}
                 {%- do upper_column_list.append(row["column_name"]|upper) -%}
-                {%- if row['null?'] == 'false' -%}
+                {#- SHOW COLUMNS reports nullability as the string 'NOT_NULL' or
+                    'true'. Upstream compares against 'false', which never
+                    matches, leaving this cache permanently empty. Accept both
+                    spellings so the cache is populated either way. -#}
+                {%- if row['null?'] in ('false', 'NOT_NULL') -%}
                     {%- do not_null_col.append(row["column_name"]|upper) -%}
                 {%- endif -%}
                 {%- if row['data_type'] is string -%}
