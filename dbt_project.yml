@@ -44,3 +44,17 @@ vars:
 
   # Enable this parameter if you want to skip using RELY for join elimination
   dbt_constraints_always_norely: false
+
+  # Fill the constraint lookup cache with a handful of database-wide metadata
+  # queries instead of several per table. Set false to restore upstream's
+  # per-table SHOW discovery. Snowflake only; other adapters ignore it.
+  dbt_constraints_bulk_cache: true
+
+  # Apply constraint DDL as parallel ASYNC children of a Snowflake Scripting
+  # block instead of one statement per round trip. Set false to restore
+  # upstream's serial run_query per statement.
+  dbt_constraints_parallel: true
+
+  # Maximum ASYNC children per EXECUTE IMMEDIATE block. Measured throughput on
+  # Snowflake is roughly 25 concurrent children.
+  dbt_constraints_max_concurrency: 25

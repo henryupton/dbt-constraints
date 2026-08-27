@@ -42,6 +42,9 @@ dbt_constraints:
       user: "{{ env_var('SNOWFLAKE_USER') }}"
       password: "{{ env_var('SNOWFLAKE_PASSWORD', '') }}"
       private_key_path: "{{ env_var('SNOWFLAKE_PRIVATE_KEY_PATH', '') }}"
+      # Empty by default so password and key-pair auth are unaffected. Set to
+      # externalbrowser to run the Snowflake arm against an SSO-backed account.
+      authenticator: "{{ env_var('SNOWFLAKE_AUTHENTICATOR', '') }}"
       role: "{{ env_var('SNOWFLAKE_ROLE') }}"
       database: "{{ env_var('SNOWFLAKE_DATABASE') }}"
       warehouse: "{{ env_var('SNOWFLAKE_WAREHOUSE') }}"
