@@ -237,45 +237,48 @@ hatch is not one.
 **Inherited suites.** Upstream's dbt-core and dbt-fusion integration tests come with the fork
 and both must stay green. The Fusion arm is not optional, because that is what production runs.
 
-## The bulk metadata cache was wrong, and is now off by default
+## The bulk metadata cache: right for constraints, wrong for columns
 
 Recorded after measuring against a real warehouse rather than the integration
 project. This is the most important thing on this page.
 
-**The premise was false.** This design asserts that upstream's per-table metadata
-discovery is expensive, and estimated "several hundred serial round-trips" as a
-dominant cost. Measured on Snowflake, a per-table `SHOW` costs about **0.09s**,
-so the 721 of them a full production run issues total roughly **61 seconds**. The
-bulk equivalent, on the same project and the same run shape, cost **268 seconds**
-across 16 queries.
+This design treated the cache as one thing. Measured, its two halves pull in
+opposite directions, and the first two verdicts on it (all-on, then all-off)
+were both wrong.
 
-| | queries | total |
+Server-side cost, compile plus execute:
+
+| read | cost | covers |
 | --- | --- | --- |
-| upstream `SHOW ... KEYS IN TABLE` | 480 | 43.8s (0.09s avg) |
-| upstream `SHOW COLUMNS IN TABLE` | 241 | 16.8s (0.07s avg) |
-| **upstream total** | **721** | **~61s** |
-| fork `SHOW ... IN DATABASE` | 3 | 57.9s (19.3s avg) |
-| fork `SHOW ... IN SCHEMA` | 3 | 8.6s (2.87s avg) |
-| fork `INFORMATION_SCHEMA.COLUMNS` | 10 | ~200s |
-| **fork total** | **16** | **~268s** |
+| `SHOW <kind> KEYS IN SCHEMA` | **0.26s** | an entire schema |
+| `SHOW <kind> KEYS IN TABLE` | 0.08s | one table |
+| `SHOW <kind> KEYS IN DATABASE` | 19.30s | every schema in the database |
+| `INFORMATION_SCHEMA.COLUMNS` | 5.57s, of which **3.49s is compilation** | one query |
 
-Two things drive it. `INFORMATION_SCHEMA.COLUMNS` scales with the number of
-objects in the entire database rather than with the schemas asked for, and it
-dominates. And `SHOW ... IN DATABASE` averaged 19.3s against a 1300-table
-database, against 0.09s for the targeted per-table form.
+Constraint reads at schema scope are a large win: 0.26s to cover a 144-table
+schema against roughly 11.5s doing it a table at a time. **On by default.**
 
-Trading many cheap targeted reads for a few expensive broad ones is only a win
-when the per-read overhead dominates. At 0.09s per round trip it does not. The
-earlier measurements that motivated this design were taken against a small
-sandbox schema and a 33-table integration project, and did not generalise.
+Column reads are the opposite. `INFORMATION_SCHEMA` compilation scales with the
+objects in the whole database rather than the schemas asked for, and the result
+is one row per column, which then costs a measured **~0.8ms each** to walk in
+Jinja. A single schema returns 8,000+ rows; a CI database holding every open
+branch's schemas is far worse. **Off by default**, and when enabled it now
+aggregates server-side to one row per table (8,186 rows to 327 on one schema).
 
-`dbt_constraints_bulk_cache` therefore **defaults to `false`**. The machinery is
-kept, proven correct and covered by tests, because it does win where the target
-database is small or isolated. It is no longer claimed as a general improvement.
+**The bigger column win is not fetching them at all.** `table_columns_all_exist`
+now skips the lookup entirely for a contract-enforced model, because an enforced
+contract already fails the build when a model's columns disagree with its
+declaration, and the constraint test's column comes from that same declaration.
+The not-null path still needs the lookup, since it reads nullability and
+semi-structured types from the same cache entry.
 
-What survives as an unconditional win is the parallel DDL and the graph
-indexing, neither of which depends on warehouse size, plus the two upstream
-not-null bugs fixed below.
+For a project with 769 constraint-bearing tables across 12 schemas, that turns
+roughly 3,000 per-table metadata round-trips into 36 schema-scoped reads plus
+whatever the not-null tests require.
+
+**The original estimate was still wrong**, and worth recording: this design
+assumed per-table round trips were expensive. At 0.09s each they are not. The
+win comes from issuing far fewer queries, not from each one being cheaper.
 
 ## What implementation changed about this design
 

@@ -22,13 +22,25 @@ Measured on the integration project against Snowflake, same build both ways:
 
 Resulting constraint state is identical across both paths, verified row by row including every `rely` value.
 
-**Those numbers come from a 33-table integration project and do not transfer to a large warehouse.** Measured against a real one, the bulk metadata cache is a net loss: a per-table `SHOW` costs about 0.09s on Snowflake, so 721 of them total roughly 61s, while the bulk equivalent cost 268s, most of it in `INFORMATION_SCHEMA.COLUMNS`. It is therefore **off by default**, and what remains on by default is the parallel DDL and the graph indexing, which win regardless of warehouse size. See `DESIGN.md`.
+**Those numbers come from a 33-table integration project; a large warehouse behaves differently.** Measured against a real one, the two halves of the metadata cache pull in opposite directions:
+
+| read | cost | covers |
+| --- | --- | --- |
+| `SHOW <kind> KEYS IN SCHEMA` | **0.26s** | an entire schema |
+| `SHOW <kind> KEYS IN TABLE` | 0.08s | one table |
+| `SHOW <kind> KEYS IN DATABASE` | 19.30s | every schema in the database |
+| `INFORMATION_SCHEMA.COLUMNS` | 5.57s, of which **3.49s is compilation** | one query |
+
+So constraint reads are bulk by default and column reads are not. `INFORMATION_SCHEMA` compilation scales with the objects in the whole database rather than the schemas asked for, and it returns a row per column, measured at ~0.8ms each to walk in Jinja.
+
+Better still, a **contract-enforced model skips the column lookup entirely** on the PK/UK/FK paths, because an enforced contract already fails the build when a model's columns disagree with its declaration. For a project with 769 constraint-bearing tables across 12 schemas, that turns roughly 3,000 per-table round trips into 36 schema-scoped reads. See `DESIGN.md`.
 
 ### Configuration
 
 | Var | Default | Effect |
 | --- | --- | --- |
-| `dbt_constraints_bulk_cache` | `false` | `true` fills the lookup cache from bulk metadata reads. Off by default because it loses on a large warehouse, see below. |
+| `dbt_constraints_bulk_cache` | `true` | Read constraint metadata a schema at a time rather than a table at a time. |
+| `dbt_constraints_bulk_columns` | `false` | Also read column metadata in bulk. Off by default, see below. |
 | `dbt_constraints_parallel` | `true` | `false` restores upstream serial `run_query` per statement. |
 | `dbt_constraints_max_concurrency` | `25` | `ASYNC` children per `EXECUTE IMMEDIATE` block. |
 | `dbt_constraints_bulk_schema_threshold` | `5` | Warm per schema at or below this many schemas, per database above it. |
