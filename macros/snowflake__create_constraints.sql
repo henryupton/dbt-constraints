@@ -31,7 +31,7 @@
             ALTER {{ ddl_prefix_for_alter }} TABLE {{ table_relation }} ADD CONSTRAINT {{ constraint_name }} PRIMARY KEY ( {{ columns_csv }} ) {{ rely_clause }}
             {%- endset -%}
             {%- do log("Creating primary key: " ~ constraint_name ~ " " ~ rely_clause, info=true) -%}
-            {%- do run_query(query) -%}
+            {%- do dbt_constraints.enqueue_ddl(lookup_cache, query, constraint_name, dbt_constraints.relation_cache_key(table_relation)) -%}
             {#- Add this constraint to the lookup cache -#}
             {%- do lookup_cache.unique_keys[table_relation].update( {constraint_name:
                 {   "columns": column_names,
@@ -45,7 +45,7 @@
            Flip RELY/NORELY on the existing constraint to match the latest test result. -#}
         {%- set rely_clause = 'NORELY' if rely_clause == '' else rely_clause -%}
         {%- if dbt_constraints.have_ownership_priv(table_relation, verify_permissions, lookup_cache) -%}
-            {%- do dbt_constraints.set_rely_norely(table_relation, existing_constraint, lookup_cache.unique_keys[table_relation][existing_constraint].rely, rely_clause) -%}
+            {%- do dbt_constraints.set_rely_norely(table_relation, existing_constraint, lookup_cache.unique_keys[table_relation][existing_constraint].rely, rely_clause, lookup_cache) -%}
             {#- Keep the lookup cache in sync with the new rely value -#}
             {%- do lookup_cache.unique_keys[table_relation].update( {existing_constraint:
                 {   "columns": column_names,
@@ -77,7 +77,7 @@
             ALTER {{ ddl_prefix_for_alter }} TABLE {{ table_relation }} ADD CONSTRAINT {{ constraint_name }} UNIQUE ( {{ columns_csv }} ) {{ rely_clause }}
             {%- endset -%}
             {%- do log("Creating unique key: " ~ constraint_name ~ " " ~ rely_clause, info=true) -%}
-            {%- do run_query(query) -%}
+            {%- do dbt_constraints.enqueue_ddl(lookup_cache, query, constraint_name, dbt_constraints.relation_cache_key(table_relation)) -%}
             {#- Add this constraint to the lookup cache -#}
             {%- do lookup_cache.unique_keys[table_relation].update( {constraint_name:
                 {   "columns": column_names,
@@ -92,7 +92,7 @@
            Flip RELY/NORELY on the existing constraint to match the latest test result. -#}
         {%- set rely_clause = 'NORELY' if rely_clause == '' else rely_clause -%}
         {%- if dbt_constraints.have_ownership_priv(table_relation, verify_permissions, lookup_cache) -%}
-            {%- do dbt_constraints.set_rely_norely(table_relation, existing_constraint, lookup_cache.unique_keys[table_relation][existing_constraint].rely, rely_clause) -%}
+            {%- do dbt_constraints.set_rely_norely(table_relation, existing_constraint, lookup_cache.unique_keys[table_relation][existing_constraint].rely, rely_clause, lookup_cache) -%}
             {#- Keep the lookup cache in sync with the new rely value -#}
             {%- do lookup_cache.unique_keys[table_relation].update( {existing_constraint:
                 {   "columns": column_names,
@@ -126,7 +126,7 @@
                 ALTER {{ ddl_prefix_for_alter }} TABLE {{ fk_table_relation }} ADD CONSTRAINT {{ constraint_name }} FOREIGN KEY ( {{ fk_columns_csv }} ) REFERENCES {{ pk_table_relation }} ( {{ pk_columns_csv }} ) {{ rely_clause }}
                 {%- endset -%}
                 {%- do log("Creating foreign key: " ~ constraint_name ~ " referencing " ~ pk_table_relation.identifier ~ " " ~ pk_column_names ~ " " ~ rely_clause, info=true) -%}
-                {%- do run_query(query) -%}
+                {%- do dbt_constraints.enqueue_ddl(lookup_cache, query, constraint_name, dbt_constraints.relation_cache_key(fk_table_relation)) -%}
                 {#- Add this constraint to the lookup cache -#}
                 {%- do lookup_cache.foreign_keys[fk_table_relation].update( {constraint_name:
                     {   "columns": fk_column_names,
@@ -141,7 +141,7 @@
                Flip RELY/NORELY on the existing constraint to match the latest test result. -#}
             {%- set rely_clause = 'NORELY' if rely_clause == '' else rely_clause -%}
             {%- if dbt_constraints.have_ownership_priv(fk_table_relation, verify_permissions, lookup_cache) -%}
-                {%- do dbt_constraints.set_rely_norely(fk_table_relation, existing_constraint, lookup_cache.foreign_keys[fk_table_relation][existing_constraint].rely, rely_clause) -%}
+                {%- do dbt_constraints.set_rely_norely(fk_table_relation, existing_constraint, lookup_cache.foreign_keys[fk_table_relation][existing_constraint].rely, rely_clause, lookup_cache) -%}
                 {#- Keep the lookup cache in sync with the new rely value -#}
                 {%- do lookup_cache.foreign_keys[fk_table_relation].update( {existing_constraint:
                     {   "columns": fk_column_names,
@@ -194,7 +194,7 @@
                 ALTER {{ ddl_prefix_for_alter }} TABLE {{ table_relation }} MODIFY {{ modify_statement_csv }};
             {%- endset -%}
             {%- do log("Creating not null constraint for: " ~ columns_to_change | join(", ") ~ " in " ~ table_relation ~ " " ~ rely_clause, info=true) -%}
-            {%- do run_query(query) -%}
+            {%- do dbt_constraints.enqueue_ddl(lookup_cache, query, "NOT NULL on " ~ table_relation ~ " (" ~ columns_to_change | join(", ") ~ ")", dbt_constraints.relation_cache_key(table_relation), true) -%}
             {#- Add this constraint to the lookup cache -#}
             {%- set constraint_key = table_relation.identifier ~ "_" ~ columns_to_change|join('_') ~ "_NN" -%}
             {%- do lookup_cache.not_null_col.update({table_relation: existing_not_null_col }) -%}
@@ -210,7 +210,7 @@
 
 
 {#- This macro alters constraints to use RELY or NORELY based on failed and passed tests -#}
-{%- macro set_rely_norely(table_relation, constraint_name, constraint_rely, rely_clause) -%}
+{%- macro set_rely_norely(table_relation, constraint_name, constraint_rely, rely_clause, lookup_cache) -%}
     {%- if ( rely_clause == 'NORELY' and constraint_rely == 'true' )
             or ( rely_clause == 'RELY' and constraint_rely == 'false' ) -%}
         {%- set ddl_prefix_for_alter = 'ICEBERG' if table_relation.is_iceberg_format else '' -%}
@@ -218,7 +218,7 @@
         ALTER {{ ddl_prefix_for_alter }} TABLE {{ table_relation }} MODIFY CONSTRAINT {{ constraint_name }} {{ rely_clause }}
         {%- endset -%}
         {%- do log("Updating constraint: " ~ constraint_name ~ " " ~ rely_clause, info=true) -%}
-        {%- do run_query(query) -%}
+        {%- do dbt_constraints.enqueue_ddl(lookup_cache, query, constraint_name ~ " " ~ rely_clause, dbt_constraints.relation_cache_key(table_relation)) -%}
     {%- endif -%}
 {%- endmacro -%}
 

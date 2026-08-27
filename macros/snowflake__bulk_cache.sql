@@ -43,11 +43,17 @@
 
         {#- Constraint metadata. PRIMARY KEYS and UNIQUE KEYS both land in the
             unique_keys bucket, matching how upstream's per-table lookup treats
-            them as interchangeable for satisfying a foreign key's parent. -#}
-        {%- for show_kind, bucket_name, name_col, col_col in [
-                ('PRIMARY KEYS',  'unique_keys',  'constraint_name', 'column_name'),
-                ('UNIQUE KEYS',   'unique_keys',  'constraint_name', 'column_name'),
-                ('IMPORTED KEYS', 'foreign_keys', 'fk_name',         'fk_column_name') ] -%}
+            them as interchangeable for satisfying a foreign key's parent.
+
+            SHOW IMPORTED KEYS reports two tables per row, the parent and the
+            child, so it has no bare schema_name or table_name column. Scoped
+            IN TABLE upstream never had to choose between them; at database
+            scope the child table is the one that owns the constraint, so its
+            fk_ prefixed columns are the ones to key on. -#}
+        {%- for show_kind, bucket_name, name_col, col_col, schema_col, table_col in [
+                ('PRIMARY KEYS',  'unique_keys',  'constraint_name', 'column_name',    'schema_name',    'table_name'),
+                ('UNIQUE KEYS',   'unique_keys',  'constraint_name', 'column_name',    'schema_name',    'table_name'),
+                ('IMPORTED KEYS', 'foreign_keys', 'fk_name',         'fk_column_name', 'fk_schema_name', 'fk_table_name') ] -%}
 
             {%- set rows = run_query("SHOW " ~ show_kind ~ " IN DATABASE " ~ database) -%}
 
@@ -56,10 +62,20 @@
                            ~ " returned " ~ rows.rows | length ~ " rows, at or above the " ~ show_cap
                            ~ " row cap, so it may be truncated. Falling back to per-table lookups for this database.", info=true) -%}
                 {%- set state.truncated = true -%}
+            {%- elif rows.rows | length > 0
+                     and (rows.rows[0][schema_col] is none or rows.rows[0][table_col] is none) -%}
+                {#- The column this bulk read keys on is absent or null, which
+                    means Snowflake's SHOW output has changed shape. Keying on it
+                    anyway would build wrong cache entries and silently recreate
+                    constraints that already exist, so refuse to warm instead. -#}
+                {%- do log("dbt_constraints: SHOW " ~ show_kind ~ " IN DATABASE " ~ database
+                           ~ " did not return usable " ~ schema_col ~ "/" ~ table_col
+                           ~ " columns. Falling back to per-table lookups for this database.", info=true) -%}
+                {%- set state.truncated = true -%}
             {%- else -%}
                 {%- set bucket = lookup_cache.bulk[bucket_name] -%}
                 {%- for row in rows.rows -%}
-                    {%- set fqn = (database ~ '.' ~ row['schema_name'] ~ '.' ~ row['table_name']) | upper -%}
+                    {%- set fqn = (database ~ '.' ~ row[schema_col] ~ '.' ~ row[table_col]) | upper -%}
                     {%- if fqn not in bucket -%}
                         {%- do bucket.update({fqn: {}}) -%}
                     {%- endif -%}

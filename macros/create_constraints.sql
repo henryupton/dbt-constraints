@@ -138,39 +138,100 @@
     {%- if execute and var('dbt_constraints_enabled', "false")|string|lower == "true" and results -%}
         {%- do log("Running dbt Constraints", info=true) -%}
 
+        {#- `lookup_cache` doubles as the per-run context. Alongside upstream's
+            metadata buckets it now carries the pending DDL queue, the bulk
+            metadata read, and the graph indexes, so no macro signature has to
+            change to reach them. -#}
         {%- set lookup_cache = {
             "table_columns": { },
             "table_privileges": { },
             "unique_keys": { },
             "not_null_col": { },
             "semi_structured_col": { },
-            "foreign_keys": { } } -%}
+            "foreign_keys": { },
+            "ddl_queue": [ ],
+            "bulk": {
+                "unique_keys": { },
+                "foreign_keys": { },
+                "columns": { },
+                "not_null": { },
+                "semi_structured": { },
+                "databases": [ ] } } -%}
 
+        {%- do dbt_constraints.warm_lookup_cache(
+                dbt_constraints.constraint_warm_targets(constraint_types), lookup_cache) -%}
+
+        {#- Each phase flushes before the next begins. That ordering is what
+            foreign keys depend on: upstream sequences not_null, then PK, then
+            UK, then FK precisely so a foreign key's parent already carries a
+            PK or UK by the time the FK is applied. Flushing at the phase
+            boundary inherits that guarantee without any new reasoning, and a
+            flush with an empty queue returns immediately. -#}
         {%- if 'not_null' in constraint_types and var('dbt_constraints_nn_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['not_null'], quote_columns, lookup_cache) -%}
+            {%- do dbt_constraints.flush_ddl_queue(lookup_cache) -%}
         {%- endif -%}
         {%- if 'primary_key' in constraint_types and var('dbt_constraints_pk_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['primary_key'], quote_columns, lookup_cache) -%}
+            {%- do dbt_constraints.flush_ddl_queue(lookup_cache) -%}
         {%- endif -%}
         {%- if 'unique_key' in constraint_types and var('dbt_constraints_uk_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['unique_key'], quote_columns, lookup_cache) -%}
+            {%- do dbt_constraints.flush_ddl_queue(lookup_cache) -%}
         {%- endif -%}
         {%- if 'unique_combination_of_columns' in constraint_types and var('dbt_constraints_uk_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['unique_combination_of_columns'], quote_columns, lookup_cache) -%}
+            {%- do dbt_constraints.flush_ddl_queue(lookup_cache) -%}
         {%- endif -%}
         {%- if 'unique' in constraint_types and var('dbt_constraints_uk_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['unique'], quote_columns, lookup_cache) -%}
+            {%- do dbt_constraints.flush_ddl_queue(lookup_cache) -%}
         {%- endif -%}
         {%- if 'foreign_key' in constraint_types and var('dbt_constraints_fk_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['foreign_key'], quote_columns, lookup_cache) -%}
+            {%- do dbt_constraints.flush_ddl_queue(lookup_cache) -%}
         {%- endif -%}
         {%- if 'relationships' in constraint_types and var('dbt_constraints_fk_enabled', "true")|string|lower == "true" -%}
             {%- do dbt_constraints.create_constraints_by_type(['relationships'], quote_columns, lookup_cache) -%}
+            {%- do dbt_constraints.flush_ddl_queue(lookup_cache) -%}
         {%- endif -%}
 
         {%- do log("Finished dbt Constraints", info=true) -%}
     {%- endif -%}
 
+{%- endmacro -%}
+
+
+{#- Collect the databases and schemas that carry constraint tests, as a dict of
+    {database: [schema, ...]}.
+
+    This drives the bulk metadata warm. It reads node.database and node.schema
+    straight off the graph rather than building relations, so it costs nothing
+    beyond one pass over the constraint tests. -#}
+{%- macro constraint_warm_targets(constraint_types) -%}
+    {%- set targets = {} -%}
+    {%- for test_model in graph.nodes.values() | selectattr("resource_type", "equalto", "test")
+            if test_model.test_metadata
+            and test_model.test_metadata.name
+            and test_model.test_metadata.name is in( constraint_types )
+            and test_model.depends_on
+            and test_model.depends_on.nodes -%}
+        {%- for node_id in test_model.depends_on.nodes -%}
+            {#- Sources live in graph.sources, models and seeds in graph.nodes.
+                Missing one only costs a per-table fallback, never correctness. -#}
+            {%- set node = graph.nodes.get(node_id) or graph.sources.get(node_id) -%}
+            {%- if node and node.database and node.schema -%}
+                {%- set db = node.database | upper -%}
+                {%- if db not in targets -%}
+                    {%- do targets.update({db: []}) -%}
+                {%- endif -%}
+                {%- if (node.schema | upper) not in targets[db] -%}
+                    {%- do targets[db].append(node.schema | upper) -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endfor -%}
+    {{ return(targets) }}
 {%- endmacro -%}
 
 
