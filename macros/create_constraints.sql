@@ -156,7 +156,7 @@
                 "columns": { },
                 "not_null": { },
                 "semi_structured": { },
-                "databases": [ ] } } -%}
+                "warmed": [ ] } } -%}
 
         {#- Adapters with no bulk path resolve this to a no-op, so the graph walk
             that computes the warm targets happens inside the Snowflake
@@ -265,21 +265,31 @@
     the parents are dims carrying their own primary key tests, so their schema
     is already a warm target and nothing falls through at all. -#}
 {%- macro constraint_warm_targets(constraint_types) -%}
+    {#- The `selected_resources` clause below restricts this to tests the
+        invocation will actually process. Without it the warm is sized by the
+        whole project regardless of what ran, so a seventeen-node deploy pays
+        the same discovery cost as a full build. -#}
     {%- set targets = {} -%}
     {%- for test_model in graph.nodes.values() | selectattr("resource_type", "equalto", "test")
             if test_model.test_metadata
             and test_model.test_metadata.name
             and test_model.test_metadata.name is in( constraint_types )
-            and test_model.attached_node -%}
+            and test_model.attached_node
+            and ( test_model.unique_id in selected_resources
+                  or test_model.attached_node in selected_resources ) -%}
         {%- set node = graph.nodes.get(test_model.attached_node) -%}
         {%- if node and node.database and node.schema -%}
             {%- set db = node.database | upper -%}
+            {%- set sch = node.schema | upper -%}
             {%- if db not in targets -%}
-                {%- do targets.update({db: []}) -%}
+                {%- do targets.update({db: {}}) -%}
             {%- endif -%}
-            {%- if (node.schema | upper) not in targets[db] -%}
-                {%- do targets[db].append(node.schema | upper) -%}
+            {%- if sch not in targets[db] -%}
+                {%- do targets[db].update({sch: {}}) -%}
             {%- endif -%}
+            {#- Distinct relations, so the count reflects tables to look up rather
+                than tests, which is what the bulk-versus-per-table trade turns on. -#}
+            {%- do targets[db][sch].update({ (node.alias or node.name) | upper: true }) -%}
         {%- endif -%}
     {%- endfor -%}
     {{ return(targets) }}

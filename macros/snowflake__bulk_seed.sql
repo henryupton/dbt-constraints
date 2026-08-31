@@ -16,7 +16,7 @@
     {%- if not dbt_constraints.bulk_cache_eligible(relation) -%}
         {{ return(false) }}
     {%- endif -%}
-    {%- if (relation.database | upper) not in lookup_cache.bulk.databases -%}
+    {%- if (relation.database ~ '.' ~ relation.schema) | upper not in lookup_cache.bulk.warmed -%}
         {{ return(false) }}
     {%- endif -%}
 
@@ -39,7 +39,7 @@
     {%- if not dbt_constraints.bulk_cache_eligible(relation) -%}
         {{ return(false) }}
     {%- endif -%}
-    {%- if (relation.database | upper) not in lookup_cache.bulk.databases -%}
+    {%- if (relation.database ~ '.' ~ relation.schema) | upper not in lookup_cache.bulk.warmed -%}
         {{ return(false) }}
     {%- endif -%}
     {{ return( dbt_constraints.relation_cache_key(relation) in lookup_cache.bulk.columns ) }}

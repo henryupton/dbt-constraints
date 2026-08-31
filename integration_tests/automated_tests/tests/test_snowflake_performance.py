@@ -25,7 +25,10 @@ PROJECT = os.path.abspath(
     os.path.join(os.path.dirname(__file__), "..", "..", "dbt-fusion")
 )
 
-FAST = ["--vars", "{dbt_constraints_bulk_cache: true, dbt_constraints_parallel: true}"]
+# min_tables_per_schema is forced to 0 so the bulk path is actually exercised.
+# The integration project is far below the production break-even, so at the
+# shipped default it would legitimately skip the warm and test nothing.
+FAST = ["--vars", "{dbt_constraints_bulk_cache: true, dbt_constraints_parallel: true, dbt_constraints_bulk_min_tables_per_schema: 0}"]
 SERIAL = ["--vars", "{dbt_constraints_bulk_cache: false, dbt_constraints_parallel: false}"]
 # What actually ships. Deliberately passes no vars at all, so this arm tracks
 # whatever the defaults in dbt_project.yml become rather than a copy of them
@@ -132,4 +135,6 @@ def test_bulk_cache_is_actually_used():
     assert "constraint cache warmed for" in out, (
         "bulk cache did not warm; the fast path degraded to per-table lookups\n" + out
     )
-    assert "constraint cache warmed for 0 database(s)" not in out
+    assert "constraint cache warmed for 0 schema(s)" not in out, (
+        "bulk warm ran but covered no schemas\n" + out
+    )

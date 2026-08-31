@@ -62,11 +62,41 @@
     {%- set schema_threshold = var('dbt_constraints_bulk_schema_threshold', 50) | int -%}
     {%- set bulk_columns = var('dbt_constraints_bulk_columns', "false")|string|lower == "true" -%}
 
-    {%- for database, schemas in targets.items() -%}
+    {#- Bulk discovery has a fixed cost per schema and per-table discovery has a
+        cost per table, so which one wins depends entirely on how many tables in
+        that schema the run actually touches. Measured in a deployment: a
+        schema-scoped read costs ~2.75s end to end, and a per-table lookup ~0.09s
+        across roughly four reads per table, so a schema pays for its bulk read
+        at around thirty tables.
+
+        Judged per schema rather than per run, because a single run routinely
+        touches one schema heavily and another barely. Below the threshold the
+        schema is simply left out and its tables fall through to upstream's
+        per-table lookups, which is both correct and, at that size, faster. -#}
+    {%- set min_tables = var('dbt_constraints_bulk_min_tables_per_schema', 30) | int -%}
+
+    {%- for database, all_schemas in targets.items() -%}
         {%- set state = namespace(truncated=false) -%}
 
+        {%- set schemas = [] -%}
+        {%- set skipped = [] -%}
+        {%- for schema, tables in all_schemas.items() -%}
+            {%- if tables | length >= min_tables -%}
+                {%- do schemas.append(schema) -%}
+            {%- else -%}
+                {%- do skipped.append(schema ~ "(" ~ tables | length ~ ")") -%}
+            {%- endif -%}
+        {%- endfor -%}
+
+        {%- if schemas | length == 0 -%}
+            {%- do log("dbt_constraints: skipping bulk warm for " ~ database
+                       ~ ", no schema reaches " ~ min_tables ~ " tables in this run"
+                       ~ " (" ~ (skipped | join(", ")) ~ "). Using per-table lookups.", info=true) -%}
+            {%- continue -%}
+        {%- endif -%}
+
         {%- set scopes = [] -%}
-        {%- if schemas | length > 0 and schemas | length <= schema_threshold -%}
+        {%- if schemas | length <= schema_threshold -%}
             {%- for schema in schemas -%}
                 {%- do scopes.append("SCHEMA " ~ database ~ "." ~ schema) -%}
             {%- endfor -%}
@@ -158,11 +188,17 @@
             {%- endfor -%}
         {%- endif -%}
 
+        {#- Marked per schema, not per database. A database-level marker would
+            make bulk_seed answer for a schema this run deliberately skipped,
+            returning "no constraints" for a table that has them and provoking an
+            "already exists" failure on the recreate. -#}
         {%- if not state.truncated -%}
-            {%- do lookup_cache.bulk.databases.append(database | upper) -%}
+            {%- for schema in schemas -%}
+                {%- do lookup_cache.bulk.warmed.append((database ~ '.' ~ schema) | upper) -%}
+            {%- endfor -%}
         {%- endif -%}
     {%- endfor -%}
 
     {%- do log("dbt_constraints: bulk constraint cache warmed for "
-               ~ lookup_cache.bulk.databases | length ~ " database(s)", info=true) -%}
+               ~ lookup_cache.bulk.warmed | length ~ " schema(s)", info=true) -%}
 {%- endmacro -%}
