@@ -47,6 +47,42 @@ Better still, a **contract-enforced model skips the column lookup entirely** on 
 
 Setting `dbt_constraints_bulk_cache` and `dbt_constraints_parallel` both to `false` reduces the package to upstream behaviour, which is the first diagnostic step for any suspected regression and the control arm the parity tests compare against.
 
+### Where-configured (windowed) tests
+
+Two extras for PK/UK/FK tests carrying a `where` config, e.g. a uniqueness test on a large
+incremental fact scoped to the recently loaded window instead of a daily full-history scan:
+
+1. **The test templates tolerate dbt's `where` wrapper.** Upstream renders `from {{ model }} pk_test`,
+   and dbt's `get_where_subquery` substitutes `(select * from X where ...) dbt_subquery` for the
+   relation, producing `(...) dbt_subquery pk_test`, a syntax error. The templates now wrap the
+   relation in their own subselect so the dbt alias nests inside. No project-side
+   `get_where_subquery` override needed.
+
+1. **`rely_windowed` opt-in.** Upstream hard-codes NORELY for any where-configured test, on the
+   grounds that a partial scan proves nothing about the whole table. That stays the default. A test
+   may opt back into results-based RELY:
+
+   ```yaml
+   data_tests:
+     - dbt_constraints.primary_key:
+         config:
+           where: "_loaded_at >= dateadd(day, -7, current_timestamp())"
+           meta:
+             rely_windowed: true
+   ```
+
+   Because it's ordinary test config (`rely_windowed` directly or under `meta`), dbt's config
+   hierarchy applies: set it in `dbt_project.yml` under `data_tests:` at project or folder scope,
+   or per test as above. RELY still follows results: a passing windowed test asserts RELY, a
+   failing one flips the constraint to NORELY, a skipped one leaves it alone. Tests with a
+   non-default `warn_if` / `fail_calc` remain unconditionally NORELY.
+
+   **The opt-in is a claim, not a mechanism.** RELY licenses the optimiser to eliminate joins on
+   the assumption of table-wide uniqueness, so only set `rely_windowed` where the unscanned rows
+   are provably covered, e.g. a key-replacing incremental (`merge` / `delete+insert`) whose
+   `unique_key` equals the tested columns, no out-of-band DML, and a periodic unwindowed pass as a
+   backstop. The caller owns that argument; the package just stops vetoing it.
+
 ### Two upstream bugs fixed along the way
 
 Both caused redundant work rather than wrong results, so the end state is unaffected:

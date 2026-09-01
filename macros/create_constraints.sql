@@ -367,10 +367,19 @@
 
 {#- This macro that checks if a test has results and whether there were errors -#}
 {%- macro lookup_should_rely(test_model) -%}
-    {%- if test_model.config.where
-            or test_model.config.warn_if != "!= 0"
+    {%- if test_model.config.warn_if != "!= 0"
             or test_model.config.fail_calc != "count(*)" -%}
-        {#- Set NORELY if there is a condition on the test -#}
+        {#- Set NORELY if the test's pass verdict itself is weakened -#}
+        {{ return('NORELY') }}
+    {%- endif -%}
+
+    {%- if test_model.config.where and not dbt_constraints.rely_windowed(test_model) -%}
+        {#- Set NORELY if only part of the relation was tested. A test may opt out
+            with rely_windowed, asserting the unscanned rows are covered by an
+            out-of-band argument (e.g. a key-replacing incremental whose unique_key
+            equals the tested columns, so old rows cannot gain duplicates). A passing
+            windowed test then earns RELY via the results loop below; a failing or
+            skipped one still gets NORELY / '' there. -#}
         {{ return('NORELY') }}
     {%- endif -%}
 
@@ -389,6 +398,17 @@
         {%- endif -%}
     {%- endfor -%}
     {{ return('') }}
+{%- endmacro -%}
+
+
+{#- This macro checks if a test has rely_windowed set (config or config.meta),
+    opting a where-configured test back into results-based RELY -#}
+{%- macro rely_windowed(test_model) -%}
+    {%- if test_model.config.get("rely_windowed", "false")|string|lower == "true"
+        or test_model.config.get("meta", {}).get("rely_windowed", "false")|string|lower == "true" -%}
+        {{ return(true) }}
+    {%- endif -%}
+    {{ return(false) }}
 {%- endmacro -%}
 
 
