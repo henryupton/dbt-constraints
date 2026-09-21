@@ -83,14 +83,15 @@ incremental fact scoped to the recently loaded window instead of a daily full-hi
    `unique_key` equals the tested columns, no out-of-band DML, and a periodic unwindowed pass as a
    backstop. The caller owns that argument; the package just stops vetoing it.
 
-### Two upstream bugs fixed along the way
+### Three upstream bugs fixed along the way
 
-Both caused redundant work rather than wrong results, so the end state is unaffected:
+All caused redundant work rather than wrong results, so the end state is unaffected:
 
 - `create_not_null` compared raw test parameters against an uppercased cache, so its "already not null" check never matched. The sibling semi-structured check on the next line does normalise case, which marks this an oversight.
 - The `SHOW COLUMNS` fallback tested nullability against `'false'`, but Snowflake reports `'NOT_NULL'`, leaving that cache permanently empty.
+- The materialization filter OR-ed `config.materialized` against `meta.materialized`, so with `meta.materialized` unset (the normal case) nothing was ever filtered out. Every view and ephemeral model with a constraint test reached `get_relation` and logged a "table was not found" skip, and every standard table was treated as a custom materialization for the ownership check. `meta.materialized` now overrides `config.materialized` only when set.
 
-Together they re-issued every not-null statement on every run.
+The first two together re-issued every not-null statement on every run.
 
 ## How the dbt Constraints Package differs from dbt's Model Contracts feature
 

@@ -509,8 +509,7 @@
                 {%- set candidate = dbt_constraints.node_index(lookup_cache).get(table_node) -%}
                 {%- for node in ([candidate] if candidate else [])
                     if node.config
-                    and ( node.config.get("materialized", "other") not in ("view", "ephemeral", "dynamic_table")
-                        or node.config.get("meta", {}).get("materialized", "other") not in ("view", "ephemeral", "dynamic_table") )
+                    and dbt_constraints.effective_materialization(node) not in ("view", "ephemeral", "dynamic_table")
                     and ( node.resource_type in ("model", "snapshot", "seed")
                         or ( node.resource_type == "source" and dbt_constraints_sources_enabled
                             and ( ( dbt_constraints_sources_pk_enabled and test_name in("primary_key") )
@@ -536,8 +535,7 @@
                     {#- Append to our list of models for this test -#}
                     {%- do table_models.append(node) -%}
                     {%- if node.resource_type == "source"
-                        or node.config.get("materialized", "other") not in ("table", "incremental", "snapshot", "seed")
-                        or node.config.get("meta", {}).get("materialized", "other") not in ("table", "incremental", "snapshot", "seed") -%}
+                        or dbt_constraints.effective_materialization(node) not in ("table", "incremental", "snapshot", "seed") -%}
                         {#- If we are using a sources or custom materializations, we will need to verify permissions -#}
                         {%- set ns.verify_permissions = true -%}
                     {%- endif -%}
@@ -754,6 +752,23 @@
         {%- do lookup_cache.update({'contracted': contracted}) -%}
     {%- endif -%}
     {{ return(lookup_cache.contracted) }}
+{%- endmacro -%}
+
+
+{#- The materialization a node effectively has, for deciding whether it can
+    carry constraints and whether its permissions need verifying.
+
+    `meta.materialized` lets a custom materialization declare the shape it
+    produces (a custom table-like strategy can say `table`), and overrides
+    `config.materialized` only when it is set. Upstream OR-ed the two tests
+    instead, so a plain `materialized: view` passed the filter whenever
+    `meta.materialized` was unset, which is nearly always: every view then
+    reached `get_relation` and logged a "table was not found" skip, and every
+    standard table was treated as a custom materialization for the ownership
+    check. -#}
+{%- macro effective_materialization(node) -%}
+    {%- set meta = node.config.get("meta") or {} -%}
+    {{ return(meta.get("materialized") or node.config.get("materialized", "other")) }}
 {%- endmacro -%}
 
 
