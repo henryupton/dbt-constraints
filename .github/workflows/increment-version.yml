@@ -1,0 +1,57 @@
+name: Increment Version
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+jobs:
+  increment-version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # Fork releases are <upstream>-envato.<n>. The base is the nearest upstream tag on main,
+      # so merging a newer upstream release restarts the counter at 1.
+      - name: Calculate new version
+        id: new-version
+        run: |
+          BASE=$(git describe --tags --abbrev=0 --exclude '*-envato.*')
+          LAST_N=$(git tag --list "$BASE-envato.*" | awk -F'-envato.' '{print $2}' | sort -n | tail -1)
+          NEW_VERSION="$BASE-envato.$(( ${LAST_N:-0} + 1 ))"
+          PREVIOUS_TAG="${LAST_N:+$BASE-envato.$LAST_N}"
+          echo "new_version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "previous_tag=${PREVIOUS_TAG:-$BASE}" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION"
+
+      - name: Create and push new tag
+        run: |
+          NEW_VERSION="${{ steps.new-version.outputs.new_version }}"
+          git tag "$NEW_VERSION"
+          git push origin "$NEW_VERSION"
+          echo "Created and pushed tag: $NEW_VERSION"
+
+      - name: Create GitHub Release
+        run: |
+          NEW_VERSION="${{ steps.new-version.outputs.new_version }}"
+          PREVIOUS_TAG="${{ steps.new-version.outputs.previous_tag }}"
+
+          gh release create "$NEW_VERSION" \
+            --title "Release $NEW_VERSION" \
+            --notes "## What's Changed
+
+          Automated release with version increment.
+
+          **Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREVIOUS_TAG...$NEW_VERSION"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Pins gh to this repo, never the fork's upstream parent.
+          GH_REPO: ${{ github.repository }}
